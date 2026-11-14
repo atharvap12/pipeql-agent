@@ -3,12 +3,29 @@ import requests
 import pandas as pd
 from datetime import datetime
 from utils.api_sources import API_SOURCES, call_api, extract_records, resolve_source, source_name
+from utils.sandbox import SandboxResult, run_in_sandbox
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 
 # Fixed output folders. The tools always save here; the LLM cannot choose another folder.
 EXTRACT_DIR = os.path.join(PROJECT_ROOT, "data", "extract")
 TRANSFORM_DIR = os.path.join(PROJECT_ROOT, "data", "transform")
+DATA_DIR = os.path.join(PROJECT_ROOT, "data")
+
+
+def resolve_data_file(file_path: str) -> str | None:
+    """
+    Turn a path from the LLM into an absolute path, but only if it points to an
+    existing file inside the project's data/ folder. Symlinks are followed first,
+    so a link inside data/ can't point at e.g. ~/.ssh or .env.
+
+    Returns:
+        str | None: The resolved absolute path, or None if the file is not allowed.
+    """
+    resolved = os.path.realpath(os.path.join(PROJECT_ROOT, file_path))
+    if os.path.commonpath([resolved, DATA_DIR]) != DATA_DIR or not os.path.isfile(resolved):
+        return None
+    return resolved
 
 
 def new_file_path(folder: str, source: str, format: str) -> str:
@@ -125,23 +142,21 @@ class ETLTools:
         return top_3_rows
 
 
-    def execute_code(self,code:str):
+    def execute_code(self, code: str, input_file: str, output_file: str) -> SandboxResult:
         """
-        This tool executes the provided code and returns the output.
+        Run the generated code in an isolated Docker container (see utils/sandbox.py)
+        with no network and access only to the input file. The code must read
+        /data/in/<input file name> and write /data/out/<output file name>; that file
+        is then copied to output_file.
 
         Args:
             code (str): The code to be executed.
+            input_file (str): Host path of the file the code reads (mounted read-only).
+            output_file (str): Host path where the result is saved.
         Returns:
-            str: The output of the executed code or an error message if execution fails.
+            SandboxResult: Whether it worked, a message, and the code's stdout/stderr.
         """
-
-        # Fresh globals dict so the generated code runs like its own script: its imports are
-        # visible inside its functions/lambdas, and it can't touch this method's locals.
-        try:
-            exec(code, {})
-            return "Code executed successfully."
-        except Exception as e:
-            return f"Failed to execute code: {e}"
+        return run_in_sandbox(code, input_file, output_file)
 
 
 if __name__ == "__main__":

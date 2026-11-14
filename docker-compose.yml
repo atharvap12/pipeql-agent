@@ -3,7 +3,7 @@
 services:
   postgres:
     image: postgres:16
-    container_name: data-agent-pg
+    container_name: pipeql-pg
     restart: unless-stopped
     # Creates the app roles and database on every start if they don't exist.
     entrypoint: ["/usr/local/bin/entrypoint.sh"]
@@ -31,4 +31,4 @@ services:
 
 volumes:
   pgdata:
-    name: data-agent-pgdata
+    name: pipeql-pgdata

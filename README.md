@@ -64,7 +64,7 @@ A tool-calling loop: the LLM picks a tool, the tool runs, the result goes back t
 | Tool | What it does |
 |---|---|
 | `extract_load_tool` | Calls a REST API and saves the records to `data/extract/` as CSV, JSON, or Parquet. |
-| `transform_load_tool` | Shows the LLM the first rows of a file, has it write Pandas code for your transformation, runs that code, and checks that the output file really was written to `data/transform/`. |
+| `transform_load_tool` | Shows the LLM the first rows of a file, has it write Pandas code for your transformation, runs that code in an isolated Docker sandbox, and saves the result to `data/transform/`. Only files inside `data/` can be transformed. |
 
 **Named sources** (`utils/api_sources.py`) let the agent ask for a source by name instead of a URL. API keys are added from the environment at call time, so they never appear in the LLM prompt.
 
@@ -72,6 +72,17 @@ A tool-calling loop: the LLM picks a tool, the tool runs, the result goes back t
 |---|---|
 | `pokemon` | Pokemon list from PokeAPI (name, url). No key needed. |
 | `marketstack` | End-of-day stock prices for AAPL and MSFT from Marketstack. Needs `MARKETSTACK_API_KEY`. |
+
+### The code sandbox
+
+The Pandas code written by the LLM never runs in the agent's own process. `utils/sandbox.py` starts a throwaway container from `docker/sandbox/Dockerfile` for each transform:
+
+- **No network** (`--network none`): the code can't download anything or send data out.
+- **Sees only what it needs:** the input file, read-only, at `/data/in/`, and an empty temporary folder at `/data/out/`. No project files, no `.env`, and none of your environment variables.
+- **Locked down:** read-only filesystem, non-root user, all Linux capabilities dropped, `no-new-privileges`, and a `noexec` `/tmp`.
+- **Limited:** 1 GB memory, 1 CPU, 64 processes, 512 MB per file, and a 120 s timeout.
+
+When the container exits, only the one expected output file (a regular file, not a symlink) is copied to `data/transform/`. Everything else is thrown away. The image is built automatically the first time it's needed, and rebuilt whenever the Dockerfile changes. The code can use only `pandas`, `numpy` and `pyarrow`.
 
 Every extract and transform writes a **new** file named `<source>_<timestamp>.<format>` (e.g. `marketstack_20261108_173935.csv`), so earlier results are never overwritten.
 
@@ -102,7 +113,7 @@ Rendered diagrams of all three graphs are in [`graphs_png/`](graphs_png/).
 ### Prerequisites
 
 - Python 3.13+ and [uv](https://docs.astral.sh/uv/)
-- Docker with Docker Compose
+- Docker with Docker Compose (also used to sandbox the generated Pandas code)
 - An [Anthropic API key](https://console.anthropic.com/)
 - (Optional) A [Marketstack](https://marketstack.com/) API key for the stock prices source
 
@@ -201,11 +212,13 @@ pipeql-agent/
 │   ├── api_sources.py       # Named API sources and the HTTP client
 │   ├── database.py          # Schema introspection and query execution
 │   ├── etl_tools.py         # Extract, preview, and run generated Pandas code
+│   ├── sandbox.py           # Runs generated code in an isolated Docker container
 │   ├── llm_pick.py          # Model tiers (Haiku / Sonnet / Opus)
 │   └── logger.py            # Shared rotating log file
 ├── models/schema.py         # Pydantic state and output schemas
 ├── docker-compose.yml       # PostgreSQL 16
 ├── docker/postgres/         # Entrypoint that creates the roles and database
+├── docker/sandbox/          # Image the generated Pandas code runs in
 ├── data/                    # Sample CSVs, plus extract/ and transform/ outputs
 └── graphs_png/              # Rendered diagrams of each graph
 ```
@@ -214,6 +227,6 @@ pipeql-agent/
 
 ## Limitations
 
-- **Generated Pandas code runs without a sandbox.** The ETL agent runs LLM-written code with `exec()` in the same process. Use it only on your own machine with data you trust. Running the code in a container or subprocess is the next step.
+- **The sandbox is a container, not a VM.** It shares the host kernel, so a kernel exploit could still escape it. For untrusted users or multi-tenant use, run it under gVisor (`--runtime=runsc`) or a microVM.
 - **No memory between requests.** Each request starts fresh, so follow-ups like "now sort that by date" don't know about the previous answer.
 - **One sample database.** The router prompt describes the ride-sharing tables, so pointing the SQL Analyst at a different database also means updating that prompt.

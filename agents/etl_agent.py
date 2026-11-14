@@ -5,7 +5,8 @@ import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from utils.llm_pick import pick_llm
-from utils.etl_tools import ETLTools, PROJECT_ROOT, TRANSFORM_DIR, new_file_path, source_from_file
+from utils.etl_tools import ETLTools, TRANSFORM_DIR, new_file_path, resolve_data_file, source_from_file
+from utils.sandbox import CONTAINER_IN_DIR, CONTAINER_OUT_DIR
 from models.schema import ETLAgentSchema
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.graph import StateGraph, START, END
@@ -67,8 +68,11 @@ def transform_load_tool(input_file_path:str, output_format:str, user_question:st
     if output_format not in ("csv", "json", "parquet"):
         return f"Unsupported output format: {output_format}"
 
-    # Absolute paths, so the generated code works no matter where the app was started from
-    input_file_path = os.path.join(PROJECT_ROOT, input_file_path)
+    # Only files inside the project's data/ folder can be transformed
+    resolved_input = resolve_data_file(input_file_path)
+    if resolved_input is None:
+        return f"Cannot transform '{input_file_path}': the file must exist inside the project's data/ folder."
+    input_file_path = resolved_input
 
     # Always a new file (<source>_<timestamp>.<format>), chosen here rather than by the LLM
     # so an existing file is never overwritten.
@@ -81,21 +85,26 @@ def transform_load_tool(input_file_path:str, output_format:str, user_question:st
 
     top_3_rows = etl_tools.transform_load_context(input_file_path)
 
+    # The code runs in a Docker sandbox, so it is given the paths as seen inside the container
+    container_input = f"{CONTAINER_IN_DIR}/{os.path.basename(input_file_path)}"
+    container_output = f"{CONTAINER_OUT_DIR}/{os.path.basename(output_file_path)}"
+
     llm = pick_llm("intermediate")
 
     prompt = f"""
             You are a Python Data Analyst who uses Pandas to analyze data. 
-            You need to provide only the Pandas Code that will help to perform the right ETL operations on the data stored in the file : {input_file_path}
+            You need to provide only the Pandas Code that will help to perform the right ETL operations on the data stored in the file : {container_input}
             as per the user's question. Do not provide any explanation or comments, only
             the code should be provided. The code should be in a format that can be executed 
             in a Python environment with Pandas installed. 
             Don't write anything else than Pandas Code. \n
             
-            Create the Pandas Dataframe from the data stored in the file : {input_file_path} and then 
+            Create the Pandas Dataframe from the data stored in the file : {container_input} and then 
             write the code to transform the data and save the result to exactly this file
-            (use this path as is, do not change the folder or the file name): {output_file_path}
+            (use this path as is, do not change the folder or the file name): {container_output}
             Save it in {output_format} format (for json use orient="records", lines=True; for csv and parquet use index=False).
-            Do not write any other files and do not overwrite the input file.
+            Do not write any other files. The input file is read-only.
+            The code runs offline with only pandas, numpy and pyarrow available.
             Here's the user's question: {user_question}\n
             Here's the context of the data you will be analyzing: {top_3_rows}\n
 
@@ -109,21 +118,17 @@ def transform_load_tool(input_file_path:str, output_format:str, user_question:st
 
     logger.info(f"[transform_load_tool] Generated pandas code:{block(pandas_code)}")
 
-    # Execute the Pandas code
-    results = etl_tools.execute_code(pandas_code)
+    # Run the Pandas code in the Docker sandbox (no network, only the input file visible)
+    result = etl_tools.execute_code(pandas_code, input_file_path, output_file_path)
+    output = f"\n\n Code output: \n {result.stdout}" if result.stdout.strip() else ""
 
-    if results.startswith("Failed"):
-        logger.error(f"[transform_load_tool] Code execution: {results}")
-        return f"The transformation failed. \n\n Pandas Code Executed: \n {pandas_code} \n\n Execution Result: \n {results}"
+    if not result.ok:
+        logger.error(f"[transform_load_tool] Code execution: {result.message}")
+        return f"The transformation failed. \n\n Pandas Code Executed: \n {pandas_code} \n\n Execution Result: \n {result.message}{output}"
 
-    # The code ran, but make sure it really wrote the file we asked for
-    if not os.path.exists(output_file_path):
-        logger.error(f"[transform_load_tool] Code ran but did not create '{output_file_path}'")
-        return f"The code ran but did not save the result to {output_file_path}. \n\n Pandas Code Executed: \n {pandas_code}"
+    logger.info(f"[transform_load_tool] Code execution: {result.message} Saved to '{output_file_path}'")
 
-    logger.info(f"[transform_load_tool] Code execution: {results} Saved to '{output_file_path}'")
-
-    return f"The data is transformed and saved to {output_file_path}. \n\n Pandas Code Executed: \n {pandas_code} \n\n Execution Result: \n {results}"
+    return f"The data is transformed and saved to {output_file_path}. \n\n Pandas Code Executed: \n {pandas_code} \n\n Execution Result: \n {result.message}{output}"
 
 
 # Toolkit 
